@@ -65,32 +65,64 @@ impl<F: TwoAdicField> EvalsDft<F> {
         let mut guard = self.twiddles.write().unwrap();
 
         let lg_n = log2_strict_usize(fft_len);
-
-        //if the current size is already big enough we don't do anything
         if lg_n <= guard.len() {
             return;
         }
 
-        //if current twiddles is empty we compute from nothing
         if guard.is_empty() {
             *guard = self.roots_of_unity_table(fft_len);
             return;
         }
 
+        // How many new rows we need
         let diff_log = lg_n - guard.len();
-        let nb_steps = 1 << diff_log; //number of missing points between each preexisting points
-
-        let generator = F::two_adic_generator(lg_n);
-
-        let table = guard[0].clone();
-        let mut nth_root = Vec::with_capacity(table.len() * nb_steps);
-        for &base in &table {
-            nth_root.extend(generator.shifted_powers(base).take(nb_steps));
-        }
+        let width = F::Packing::WIDTH;
 
         let old_twiddles = std::mem::take(&mut *guard);
-        let mut twiddles = Vec::with_capacity(diff_log + old_twiddles.len());
-        twiddles.extend((0..diff_log).map(|i| nth_root.iter().step_by(1 << i).copied().collect::<Vec<_>>()));
+        let old_first_row = &old_twiddles[0];
+
+        // In case the prior work is too small to take advantage of packings we just start from nothing
+        if old_first_row.len() < width {
+            *guard = self.roots_of_unity_table(fft_len);
+            return;
+        }
+
+        let generator = F::two_adic_generator(lg_n);
+        let ratio = 1 << diff_log;
+
+        // Precompute the vector [1, g, g^2, ..., g^(ratio - 1)]
+        let mut powers = Vec::with_capacity(ratio);
+        let mut power = F::ONE;
+        for _ in 0..ratio {
+            powers.push(power);
+            power *= generator;
+        }
+
+        let mut first_row = vec![F::ZERO; old_first_row.len() * ratio];
+
+        let old_packs = F::Packing::pack_slice(old_first_row);
+        let expanded_pack_len = width * ratio;
+
+        for (out, &old_pack) in first_row.chunks_mut(expanded_pack_len).zip(old_packs.iter()) {
+            debug_assert_eq!(out.len(), expanded_pack_len);
+
+            // We multiply the old first row packings with power to get the new elements (but unordered)
+            for (offset, &power) in powers.iter().enumerate() {
+                let expanded = if offset == 0 { old_pack } else { old_pack * power };
+                // Then we put them in the right place
+                for (lane, &value) in expanded.as_slice().iter().enumerate() {
+                    out[lane * ratio + offset] = value;
+                }
+            }
+        }
+
+        let mut twiddles = Vec::with_capacity(lg_n);
+
+        // Use step_by to get all intermediary rows and reuse the last ones
+        twiddles.push(first_row);
+        for i in 1..diff_log {
+            twiddles.push(twiddles[0].iter().step_by(1 << i).copied().collect());
+        }
         twiddles.extend(old_twiddles);
 
         *guard = twiddles;
